@@ -1,17 +1,19 @@
 import os
+import re
 import base64
 import asyncio
+import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from fastapi import FastAPI, HTTPException, Query
 import yt_dlp
 
 app = FastAPI(title="Persistent YT-DLP Internal Service")
 
-# 限制全局最多 2 个提取并发，避免突发高负载
+# 限制全局最多允许 2 个提取线程并行，确保内存稳固在 100MB 以内
 executor = ThreadPoolExecutor(max_workers=2)
 
 # ==========================================
-# 🌟 1. 还原原版 Cookie 解密逻辑
+# 🌟 1. 自动解析环境变量中的 YOUTUBE_COOKIES_BASE64
 # ==========================================
 COOKIE_FILE_PATH = None
 cookie_b64 = os.environ.get("YOUTUBE_COOKIES_BASE64")
@@ -29,10 +31,70 @@ if cookie_b64 and cookie_b64.strip():
         print(f"⚠️ [Cookie Loader] Cookie 解密失败: {e}")
         COOKIE_FILE_PATH = None
 else:
-    print("ℹ️ [Cookie Loader] 未提供 YOUTUBE_COOKIES_BASE64")
+    print("ℹ️ [Cookie Loader] 未提供 Cookie，将以免登录模式出流")
 
 # ==========================================
-# 🌟 2. 1:1 还原原版提取参数（黄金组合）
+# 🌟 2. 核心作者头像嗅探函数 (支持 800x800 超清头像)
+# ==========================================
+def extract_channel_avatar(info: dict) -> str:
+    # 策略 A：检查 yt-dlp 是否已经拿到了头像 CDN (yt3.ggpht.com 或 googleusercontent.com)
+    for key in ['uploader_avatar', 'channel_avatar', 'avatar']:
+        val = info.get(key)
+        if val and isinstance(val, str) and ('ggpht.com' in val or 'googleusercontent.com' in val):
+            return val
+
+    # 检查 channel_thumbnails
+    for t in info.get('channel_thumbnails') or []:
+        if isinstance(t, dict) and t.get('url'):
+            return t['url']
+
+    # 检查 thumbnails 列表中是否有属于头像域名的
+    for t in info.get('thumbnails') or []:
+        if isinstance(t, dict):
+            url = t.get('url', '')
+            if 'yt3.ggpht.com' in url or 'yt3.googleusercontent.com' in url:
+                return url
+
+    # 策略 B：若未携带，通过作者频道主页极速读取前 64KB 获取 og:image (耗时约 0.1s)
+    channel_url = info.get('channel_url') or info.get('uploader_url')
+    if not channel_url:
+        uploader_id = info.get('uploader_id')  # 如 @fknight
+        if uploader_id and uploader_id.startswith('@'):
+            channel_url = f"https://www.youtube.com/{uploader_id}"
+        elif info.get('channel_id'):
+            channel_url = f"https://www.youtube.com/channel/{info.get('channel_id')}"
+
+    if channel_url:
+        try:
+            req = urllib.request.Request(
+                channel_url,
+                headers={
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                    'Accept-Language': 'en-US,en;q=0.9',
+                }
+            )
+            with urllib.request.urlopen(req, timeout=3) as resp:
+                # 仅读取前 64KB 头部数据，快速抓取 OpenGraph 标签中的头像
+                head_chunk = resp.read(65536).decode('utf-8', errors='ignore')
+                
+                og_match = re.search(
+                    r'<meta\s+(?:property|name)=["\']og:image["\']\s+content=["\']([^"\']+)["\']', 
+                    head_chunk, 
+                    re.IGNORECASE
+                )
+                if og_match:
+                    return og_match.group(1)
+                
+                yt3_match = re.search(r'(https://yt3\.(?:ggpht|googleusercontent)\.com/[^\s"\'<]+)', head_chunk)
+                if yt3_match:
+                    return yt3_match.group(1)
+        except Exception as e:
+            print(f"⚠️ [Avatar Scraper] 提取头像异常: {e}")
+
+    return ""
+
+# ==========================================
+# 🌟 3. 破除机房风控的原版参数组合
 # ==========================================
 def get_original_ydl_opts(use_cookie: bool = True):
     opts = {
@@ -41,35 +103,38 @@ def get_original_ydl_opts(use_cookie: bool = True):
         'noplaylist': True,
         'no_warnings': True,
         'socket_timeout': 15,
-        # 🌟 原版 Dart 代码中写死的黄金组合：排除报错的 tv 端，激活 web 与内嵌流
         'extractor_args': {
             'youtube': {
                 'player_client': ['default', '-tv_downgraded', 'web_embedded']
             }
         }
     }
-    
-    # 原版逻辑：如果有 cookie 则挂载 --cookies
     if use_cookie and COOKIE_FILE_PATH:
         opts['cookiefile'] = COOKIE_FILE_PATH
-        
     return opts
 
 
 def _extract_worker(url: str):
-    # 策略 A：采用原版配置（带 Cookie 与 Deno 解密）
+    info = None
     try:
         with yt_dlp.YoutubeDL(get_original_ydl_opts(use_cookie=True)) as ydl:
             info = ydl.extract_info(url, download=False)
-            formats = info.get('formats') or []
-            if formats:
-                return info
     except Exception as e:
-        print(f"⚠️ [原版通道 A 异常]: {e}，尝试免 Cookie 通道重试...")
+        print(f"⚠️ [通道 A 异常]: {e}，尝试免 Cookie 纯净重试...")
+        with yt_dlp.YoutubeDL(get_original_ydl_opts(use_cookie=False)) as ydl:
+            info = ydl.extract_info(url, download=False)
 
-    # 策略 B：免 Cookie 纯净重试（防止 Cookie 自身被 Google 风控污染）
-    with yt_dlp.YoutubeDL(get_original_ydl_opts(use_cookie=False)) as ydl:
-        return ydl.extract_info(url, download=False)
+    if not info:
+        return None
+
+    # 🌟 自动提取并装配作者超清头像
+    avatar_url = extract_channel_avatar(info)
+    info['author_avatar'] = avatar_url
+    info['uploader_avatar'] = avatar_url
+    if avatar_url:
+        print(f"👤 [Avatar Scraper] 成功提取到作者超清头像: {avatar_url}")
+
+    return info
 
 
 @app.get("/health")
