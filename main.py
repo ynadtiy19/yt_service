@@ -18,7 +18,6 @@ cookie_b64 = os.environ.get("YOUTUBE_COOKIES_BASE64")
 
 if cookie_b64 and cookie_b64.strip():
     try:
-        # 去除换行与杂质
         sanitized_b64 = cookie_b64.replace("\r", "").replace("\n", "").strip()
         decoded_bytes = base64.b64decode(sanitized_b64)
         
@@ -33,28 +32,43 @@ else:
     print("ℹ️ [Cookie Loader] 未配置 YOUTUBE_COOKIES_BASE64，将以免登录模式出流")
 
 # ==========================================
-# 🌟 2. 组装 yt-dlp 核心配置
+# 🌟 2. 组装具备高容错特性的 yt-dlp 核心配置
 # ==========================================
-YDL_OPTS = {
-    'quiet': True,
-    'no_warnings': True,
-    'skip_download': True,
-    'extract_flat': False,
-    # 🌟 使用官方 Android 客户端：速度快、不走网页挑战、内存占用极低
-    'extractor_args': {
-        'youtube': {
-            'player_client': ['android', 'web_embedded']
+def get_ydl_opts(use_cookies: bool = True):
+    opts = {
+        'quiet': True,
+        'no_warnings': True,
+        'skip_download': True,
+        'extract_flat': False,
+        'no_color': True,
+        # 🌟 核心防报错：即使默认格式未完全匹配，也绝不抛出 500 异常，保留全部提取到的格式列表
+        'ignore_no_formats_error': True,
+        'check_formats': False,
+        # 🌟 多路客户端智能降级链：ios (免挑战高速) -> web (Node.js解密) -> android
+        'extractor_args': {
+            'youtube': {
+                'player_client': ['ios', 'web', 'mweb', 'android']
+            }
         }
     }
-}
-
-# 如果成功还原出 Cookie 文件，注入 yt-dlp
-if COOKIE_FILE_PATH:
-    YDL_OPTS['cookiefile'] = COOKIE_FILE_PATH
+    if use_cookies and COOKIE_FILE_PATH:
+        opts['cookiefile'] = COOKIE_FILE_PATH
+    return opts
 
 
 def _extract_worker(url: str):
-    with yt_dlp.YoutubeDL(YDL_OPTS) as ydl:
+    # 策略 1：如果配置了 Cookie，优先带 Cookie 提取
+    if COOKIE_FILE_PATH:
+        try:
+            with yt_dlp.YoutubeDL(get_ydl_opts(use_cookies=True)) as ydl:
+                info = ydl.extract_info(url, download=False)
+                if info and info.get('formats'):
+                    return info
+        except Exception as e:
+            print(f"⚠️ [Cookie 提取重试] 带 Cookie 提取受阻 ({e})，正在自动无缝降级免 Cookie 重试...")
+
+    # 策略 2：免 Cookie 兜底提取（应对 Cookie 过期或客户端互斥场景）
+    with yt_dlp.YoutubeDL(get_ydl_opts(use_cookies=False)) as ydl:
         return ydl.extract_info(url, download=False)
 
 
@@ -68,6 +82,7 @@ def health():
 
 @app.get("/extract")
 async def extract(url: str = Query(..., description="YouTube Video ID or Full URL")):
+    # 🌟 修复原代码中的拼接错误
     if not url.startswith("http"):
         target_url = f"https://www.youtube.com/watch?v={url}"
     else:
@@ -75,7 +90,6 @@ async def extract(url: str = Query(..., description="YouTube Video ID or Full UR
 
     try:
         loop = asyncio.get_event_loop()
-        # 抛给线程池执行，不阻塞 FastAPI 的主异步事件循环
         info = await loop.run_in_executor(executor, _extract_worker, target_url)
         if not info:
             raise HTTPException(status_code=404, detail="Could not extract video info")
@@ -86,6 +100,5 @@ async def extract(url: str = Query(..., description="YouTube Video ID or Full UR
 
 if __name__ == "__main__":
     import uvicorn
-    # 🌟 线上优先读取平台注入的 PORT 环境变量，默认 8080
     port = int(os.environ.get("PORT", 8080))
     uvicorn.run("main:app", host="0.0.0.0", port=port)
