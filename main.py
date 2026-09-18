@@ -7,11 +7,11 @@ import yt_dlp
 
 app = FastAPI(title="Persistent YT-DLP Internal Service")
 
-# 限制全局最多允许 2 个提取线程并行，确保内存稳固在 100MB 以内
+# 限制全局最多 2 个提取并发，避免突发高负载
 executor = ThreadPoolExecutor(max_workers=2)
 
 # ==========================================
-# 🌟 1. 自动解析环境变量中的 YOUTUBE_COOKIES_BASE64
+# 🌟 1. 还原原版 Cookie 解密逻辑
 # ==========================================
 COOKIE_FILE_PATH = None
 cookie_b64 = os.environ.get("YOUTUBE_COOKIES_BASE64")
@@ -24,51 +24,51 @@ if cookie_b64 and cookie_b64.strip():
         COOKIE_FILE_PATH = "/tmp/yt_cookies.txt"
         with open(COOKIE_FILE_PATH, "wb") as f:
             f.write(decoded_bytes)
-        print("✅ [Cookie Loader] 成功从环境变量加载 YouTube Cookie 文件！")
+        print("✅ [Cookie Loader] 成功装载 YouTube Cookie 凭据！")
     except Exception as e:
-        print(f"⚠️ [Cookie Loader] Cookie Base64 解密失败: {e}")
+        print(f"⚠️ [Cookie Loader] Cookie 解密失败: {e}")
         COOKIE_FILE_PATH = None
 else:
-    print("ℹ️ [Cookie Loader] 未配置 YOUTUBE_COOKIES_BASE64，将以免登录模式出流")
+    print("ℹ️ [Cookie Loader] 未提供 YOUTUBE_COOKIES_BASE64")
 
 # ==========================================
-# 🌟 2. 组装具备高容错特性的 yt-dlp 核心配置
+# 🌟 2. 1:1 还原原版提取参数（黄金组合）
 # ==========================================
-def get_ydl_opts(use_cookies: bool = True):
+def get_original_ydl_opts(use_cookie: bool = True):
     opts = {
-        'quiet': True,
-        'no_warnings': True,
         'skip_download': True,
         'extract_flat': False,
-        'no_color': True,
-        # 🌟 核心防报错：即使默认格式未完全匹配，也绝不抛出 500 异常，保留全部提取到的格式列表
-        'ignore_no_formats_error': True,
-        'check_formats': False,
-        # 🌟 多路客户端智能降级链：ios (免挑战高速) -> web (Node.js解密) -> android
+        'noplaylist': True,
+        'no_warnings': True,
+        'socket_timeout': 15,
+        # 🌟 原版 Dart 代码中写死的黄金组合：排除报错的 tv 端，激活 web 与内嵌流
         'extractor_args': {
             'youtube': {
-                'player_client': ['ios', 'web', 'mweb', 'android']
+                'player_client': ['default', '-tv_downgraded', 'web_embedded']
             }
         }
     }
-    if use_cookies and COOKIE_FILE_PATH:
+    
+    # 原版逻辑：如果有 cookie 则挂载 --cookies
+    if use_cookie and COOKIE_FILE_PATH:
         opts['cookiefile'] = COOKIE_FILE_PATH
+        
     return opts
 
 
 def _extract_worker(url: str):
-    # 策略 1：如果配置了 Cookie，优先带 Cookie 提取
-    if COOKIE_FILE_PATH:
-        try:
-            with yt_dlp.YoutubeDL(get_ydl_opts(use_cookies=True)) as ydl:
-                info = ydl.extract_info(url, download=False)
-                if info and info.get('formats'):
-                    return info
-        except Exception as e:
-            print(f"⚠️ [Cookie 提取重试] 带 Cookie 提取受阻 ({e})，正在自动无缝降级免 Cookie 重试...")
+    # 策略 A：采用原版配置（带 Cookie 与 Deno 解密）
+    try:
+        with yt_dlp.YoutubeDL(get_original_ydl_opts(use_cookie=True)) as ydl:
+            info = ydl.extract_info(url, download=False)
+            formats = info.get('formats') or []
+            if formats:
+                return info
+    except Exception as e:
+        print(f"⚠️ [原版通道 A 异常]: {e}，尝试免 Cookie 通道重试...")
 
-    # 策略 2：免 Cookie 兜底提取（应对 Cookie 过期或客户端互斥场景）
-    with yt_dlp.YoutubeDL(get_ydl_opts(use_cookies=False)) as ydl:
+    # 策略 B：免 Cookie 纯净重试（防止 Cookie 自身被 Google 风控污染）
+    with yt_dlp.YoutubeDL(get_original_ydl_opts(use_cookie=False)) as ydl:
         return ydl.extract_info(url, download=False)
 
 
@@ -82,7 +82,6 @@ def health():
 
 @app.get("/extract")
 async def extract(url: str = Query(..., description="YouTube Video ID or Full URL")):
-    # 🌟 修复原代码中的拼接错误
     if not url.startswith("http"):
         target_url = f"https://www.youtube.com/watch?v={url}"
     else:
