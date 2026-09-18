@@ -86,4 +86,6 @@ async def extract(url: str = Query(..., description="YouTube Video ID or Full UR
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("main:app", host="0.0.0.0", port=8080)
+    # 🌟 线上优先读取平台注入的 PORT 环境变量，默认 8080
+    port = int(os.environ.get("PORT", 8080))
+    uvicorn.run("main:app", host="0.0.0.0", port=port)
