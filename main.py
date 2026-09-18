@@ -96,7 +96,7 @@ def extract_channel_avatar(info: dict) -> str:
 
 
 # ==========================================
-# 🌟 3. 详细提取 Worker
+# 🌟 3. 单视频详细解析 Worker
 # ==========================================
 def get_original_ydl_opts(use_cookie: bool = True):
     opts = {
@@ -136,7 +136,7 @@ def _extract_worker(url: str):
 
 
 # ==========================================
-# 🌟 4. 高速扁平搜索与热门 Worker（extract_flat = 0.3秒直出）
+# 🌟 4. 高速扁平搜索与热门 Worker
 # ==========================================
 def _flat_search_worker(query: str, limit: int = 20):
     ydl_opts = {
@@ -183,10 +183,12 @@ def _flat_trending_worker():
         'no_warnings': True,
         'skip_download': True,
         'extract_flat': 'in_playlist',
+        'noplaylist': False,
         'socket_timeout': 8,
     }
+    # 🌟 核心修复：改用 ytsearch25:trending 搜索指令，彻底规避 YouTube 官方废弃网页重定向报错
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        res = ydl.extract_info("https://www.youtube.com/feed/trending", download=False)
+        res = ydl.extract_info("ytsearch25:trending", download=False)
         entries = res.get('entries') or []
         results = []
         for item in entries:
