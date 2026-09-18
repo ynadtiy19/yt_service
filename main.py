@@ -86,4 +86,4 @@ async def extract(url: str = Query(..., description="YouTube Video ID or Full UR
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("main:app", host="0.0.0.0", port=8000)
+    uvicorn.run("main:app", host="0.0.0.0", port=8080)
