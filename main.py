@@ -1,5 +1,6 @@
 import os
 import re
+import time
 import base64
 import asyncio
 import urllib.request
@@ -7,13 +8,20 @@ from concurrent.futures import ThreadPoolExecutor
 from fastapi import FastAPI, HTTPException, Query
 import yt_dlp
 
-app = FastAPI(title="Persistent YT-DLP Internal Service")
+# 🌟 1. 物理锁死 Deno V8 引擎最大内存为 64MB，严防内存溢出
+os.environ["DENO_V8_FLAGS"] = "--max-old-space-size=64"
 
-# 限制全局并发，保障内存稳定
-executor = ThreadPoolExecutor(max_workers=2)
+app = FastAPI(title="Ultra-Stable Lightweight YT-DLP Service")
+
+# 🌟 2. 核心防爆：严格限制单线程执行，多请求排队，把容器内存压死在 120MB 安全水位
+executor = ThreadPoolExecutor(max_workers=1)
+
+# 🌟 3. Python 内部毫秒级极速缓存字典（有效期 30 分钟）
+_MEMORY_CACHE = {}
+_CACHE_TTL = 1800  # 30 分钟 (秒)
 
 # ==========================================
-# 🌟 1. 自动解析环境变量中的 YOUTUBE_COOKIES_BASE64
+# 🌟 4. 自动解析 Cookie
 # ==========================================
 COOKIE_FILE_PATH = None
 cookie_b64 = os.environ.get("YOUTUBE_COOKIES_BASE64")
@@ -30,8 +38,6 @@ if cookie_b64 and cookie_b64.strip():
     except Exception as e:
         print(f"⚠️ [Cookie Loader] Cookie 解密失败: {e}")
         COOKIE_FILE_PATH = None
-else:
-    print("ℹ️ [Cookie Loader] 未提供 Cookie，将以免登录模式出流")
 
 
 def _format_duration(seconds: int) -> str:
@@ -45,9 +51,6 @@ def _format_duration(seconds: int) -> str:
     return f"{m:02d}:{s:02d}"
 
 
-# ==========================================
-# 🌟 2. 核心作者头像嗅探函数 (支持 800x800 超清头像)
-# ==========================================
 def extract_channel_avatar(info: dict) -> str:
     for key in ['uploader_avatar', 'channel_avatar', 'avatar']:
         val = info.get(key)
@@ -89,22 +92,20 @@ def extract_channel_avatar(info: dict) -> str:
                 yt3_match = re.search(r'(https://yt3\.(?:ggpht|googleusercontent)\.com/[^\s"\'<]+)', head_chunk)
                 if yt3_match:
                     return yt3_match.group(1)
-        except Exception as e:
-            print(f"⚠️ [Avatar Scraper] 提取头像异常: {e}")
+        except Exception:
+            pass
 
     return ""
 
 
-# ==========================================
-# 🌟 3. 单视频详细解析 Worker
-# ==========================================
-def get_original_ydl_opts(use_cookie: bool = True):
+def get_ydl_opts(use_cookie: bool = True):
     opts = {
         'skip_download': True,
         'extract_flat': False,
         'noplaylist': True,
         'no_warnings': True,
-        'socket_timeout': 15,
+        'socket_timeout': 12,
+        'no_color': True,
         'extractor_args': {
             'youtube': {
                 'player_client': ['default', '-tv_downgraded', 'web_embedded']
@@ -117,13 +118,21 @@ def get_original_ydl_opts(use_cookie: bool = True):
 
 
 def _extract_worker(url: str):
+    # 1. 检查 Python 内存缓存
+    now = time.time()
+    if url in _MEMORY_CACHE:
+        cached_time, cached_data = _MEMORY_CACHE[url]
+        if now - cached_time < _CACHE_TTL:
+            return cached_data
+
+    # 2. 调用 yt-dlp 进行提取
     info = None
     try:
-        with yt_dlp.YoutubeDL(get_original_ydl_opts(use_cookie=True)) as ydl:
+        with yt_dlp.YoutubeDL(get_ydl_opts(use_cookie=True)) as ydl:
             info = ydl.extract_info(url, download=False)
     except Exception as e:
-        print(f"⚠️ [通道 A 异常]: {e}，尝试免 Cookie 纯净重试...")
-        with yt_dlp.YoutubeDL(get_original_ydl_opts(use_cookie=False)) as ydl:
+        print(f"⚠️ [提取重试]: {e}")
+        with yt_dlp.YoutubeDL(get_ydl_opts(use_cookie=False)) as ydl:
             info = ydl.extract_info(url, download=False)
 
     if not info:
@@ -132,13 +141,26 @@ def _extract_worker(url: str):
     avatar_url = extract_channel_avatar(info)
     info['author_avatar'] = avatar_url
     info['uploader_avatar'] = avatar_url
+
+    # 3. 写入 Python 内存缓存
+    _MEMORY_CACHE[url] = (now, info)
+    
+    # 限制内存字典最大容量不超过 100 条
+    if len(_MEMORY_CACHE) > 100:
+        oldest_key = min(_MEMORY_CACHE.keys(), key=lambda k: _MEMORY_CACHE[k][0])
+        _MEMORY_CACHE.pop(oldest_key, None)
+
     return info
 
 
-# ==========================================
-# 🌟 4. 高速扁平搜索与热门 Worker
-# ==========================================
 def _flat_search_worker(query: str, limit: int = 20):
+    cache_key = f"search_{query}_{limit}"
+    now = time.time()
+    if cache_key in _MEMORY_CACHE:
+        cached_time, cached_data = _MEMORY_CACHE[cache_key]
+        if now - cached_time < 600:  # 搜索缓存 10 分钟
+            return cached_data
+
     ydl_opts = {
         'quiet': True,
         'no_warnings': True,
@@ -174,10 +196,19 @@ def _flat_search_worker(query: str, limit: int = 20):
                 'published_text': str(item.get('upload_date') or ''),
                 'description': item.get('description') or '',
             })
+        
+        _MEMORY_CACHE[cache_key] = (now, results)
         return results
 
 
 def _flat_trending_worker():
+    cache_key = "trending_global"
+    now = time.time()
+    if cache_key in _MEMORY_CACHE:
+        cached_time, cached_data = _MEMORY_CACHE[cache_key]
+        if now - cached_time < 1800:  # 热门缓存 30 分钟
+            return cached_data
+
     ydl_opts = {
         'quiet': True,
         'no_warnings': True,
@@ -186,7 +217,6 @@ def _flat_trending_worker():
         'noplaylist': False,
         'socket_timeout': 8,
     }
-    # 🌟 核心修复：改用 ytsearch25:trending 搜索指令，彻底规避 YouTube 官方废弃网页重定向报错
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         res = ydl.extract_info("ytsearch25:trending", download=False)
         entries = res.get('entries') or []
@@ -214,12 +244,19 @@ def _flat_trending_worker():
                 'published_text': str(item.get('upload_date') or ''),
                 'description': item.get('description') or '',
             })
+
+        _MEMORY_CACHE[cache_key] = (now, results)
         return results
 
 
+# 🌟 5. 健康检查完全独立，0 阻塞，让 Zeabur 探针永远绿灯通过
 @app.get("/health")
 def health():
-    return {"status": "ok", "has_cookies": COOKIE_FILE_PATH is not None}
+    return {
+        "status": "ok",
+        "has_cookies": COOKIE_FILE_PATH is not None,
+        "cached_entries": len(_MEMORY_CACHE)
+    }
 
 
 @app.get("/extract")
