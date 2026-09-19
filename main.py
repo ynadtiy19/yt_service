@@ -6,7 +6,12 @@ import asyncio
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from fastapi import FastAPI, HTTPException, Query
+from pydantic import BaseModel
 import yt_dlp
+
+
+class CookiePayload(BaseModel):
+    cookies_base64: str
 
 # 🌟 1. 物理锁死 Deno V8 引擎最大内存为 64MB，严防内存溢出
 os.environ["DENO_V8_FLAGS"] = "--max-old-space-size=64"
@@ -284,6 +289,26 @@ async def search(q: str = Query(..., description="Search keyword"), limit: int =
         return results
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+
+# 🌟 新增：接收浏览器容器推送过来的最新 Cookie，内存与文件秒级热替换
+@app.post("/update_cookies")
+def update_cookies(payload: CookiePayload):
+    global COOKIE_FILE_PATH, _MEMORY_CACHE
+    try:
+        raw_bytes = base64.b64decode(payload.cookies_base64.strip())
+        target_path = "/tmp/yt_cookies.txt"
+        with open(target_path, "wb") as f:
+            f.write(raw_bytes)
+        
+        COOKIE_FILE_PATH = target_path
+        # 清除旧的内存缓存，让下一次提取立刻使用全新的登录态
+        _MEMORY_CACHE.clear()
+        print("🎉 [Hot Reload] 成功接收到来自浏览器容器的最新 Cookie！")
+        return {"status": "success", "message": "Cookies updated successfully"}
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Failed to update cookies: {e}")
 
 
 @app.get("/trending")
