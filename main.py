@@ -13,6 +13,7 @@ import yt_dlp
 class CookiePayload(BaseModel):
     cookies_base64: str
 
+
 # 🌟 1. 物理锁死 Deno V8 引擎最大内存为 64MB，严防内存溢出
 os.environ["DENO_V8_FLAGS"] = "--max-old-space-size=64"
 
@@ -26,7 +27,7 @@ _MEMORY_CACHE = {}
 _CACHE_TTL = 1800  # 30 分钟 (秒)
 
 # ==========================================
-# 🌟 4. 自动解析 Cookie
+# 🌟 4. 自动解析与热重载 Cookie
 # ==========================================
 COOKIE_FILE_PATH = None
 cookie_b64 = os.environ.get("YOUTUBE_COOKIES_BASE64")
@@ -35,7 +36,7 @@ if cookie_b64 and cookie_b64.strip():
     try:
         sanitized_b64 = cookie_b64.replace("\r", "").replace("\n", "").strip()
         decoded_bytes = base64.b64decode(sanitized_b64)
-        
+
         COOKIE_FILE_PATH = "/tmp/yt_cookies.txt"
         with open(COOKIE_FILE_PATH, "wb") as f:
             f.write(decoded_bytes)
@@ -103,17 +104,19 @@ def extract_channel_avatar(info: dict) -> str:
     return ""
 
 
+# 🌟 关键修复：禁用易触发 Web 端 Botguard 的 client，改用 ios, android, mweb
 def get_ydl_opts(use_cookie: bool = True):
     opts = {
         'skip_download': True,
         'extract_flat': False,
         'noplaylist': True,
         'no_warnings': True,
-        'socket_timeout': 12,
+        'socket_timeout': 15,
         'no_color': True,
         'extractor_args': {
             'youtube': {
-                'player_client': ['default', '-tv_downgraded', 'web_embedded']
+                'player_client': ['ios', 'android', 'mweb'],
+                'player_skip': ['webpage', 'configs'],
             }
         }
     }
@@ -130,15 +133,14 @@ def _extract_worker(url: str):
         if now - cached_time < _CACHE_TTL:
             return cached_data
 
-    # 2. 调用 yt-dlp 进行提取
+    # 2. 调用 yt-dlp 进行提取（全程携带登录 Cookie）
     info = None
     try:
         with yt_dlp.YoutubeDL(get_ydl_opts(use_cookie=True)) as ydl:
             info = ydl.extract_info(url, download=False)
     except Exception as e:
-        print(f"⚠️ [提取重试]: {e}")
-        with yt_dlp.YoutubeDL(get_ydl_opts(use_cookie=False)) as ydl:
-            info = ydl.extract_info(url, download=False)
+        print(f"⚠️ [提取失败报警]: {e}")
+        return None
 
     if not info:
         return None
@@ -149,7 +151,7 @@ def _extract_worker(url: str):
 
     # 3. 写入 Python 内存缓存
     _MEMORY_CACHE[url] = (now, info)
-    
+
     # 限制内存字典最大容量不超过 100 条
     if len(_MEMORY_CACHE) > 100:
         oldest_key = min(_MEMORY_CACHE.keys(), key=lambda k: _MEMORY_CACHE[k][0])
@@ -201,7 +203,7 @@ def _flat_search_worker(query: str, limit: int = 20):
                 'published_text': str(item.get('upload_date') or ''),
                 'description': item.get('description') or '',
             })
-        
+
         _MEMORY_CACHE[cache_key] = (now, results)
         return results
 
@@ -254,7 +256,7 @@ def _flat_trending_worker():
         return results
 
 
-# 🌟 5. 健康检查完全独立，0 阻塞，让 Zeabur 探针永远绿灯通过
+# 🌟 5. 健康检查接口
 @app.get("/health")
 def health():
     return {
@@ -264,12 +266,14 @@ def health():
     }
 
 
+# 🌟 关键修复：修复了原先 target_url 截断的错误
 @app.get("/extract")
 async def extract(url: str = Query(..., description="YouTube Video ID or Full URL")):
-    if not url.startswith("http"):
-        target_url = f"https://www.youtube.com/watch?v={url}"
+    clean_url = url.strip()
+    if not clean_url.startswith("http"):
+        target_url = f"https://www.youtube.com/watch?v={clean_url}"
     else:
-        target_url = url
+        target_url = clean_url
 
     try:
         loop = asyncio.get_event_loop()
@@ -277,6 +281,8 @@ async def extract(url: str = Query(..., description="YouTube Video ID or Full UR
         if not info:
             raise HTTPException(status_code=404, detail="Could not extract video info")
         return info
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -291,8 +297,7 @@ async def search(q: str = Query(..., description="Search keyword"), limit: int =
         raise HTTPException(status_code=500, detail=str(e))
 
 
-
-# 🌟 新增：接收浏览器容器推送过来的最新 Cookie，内存与文件秒级热替换
+# 🌟 接收最新 Cookie 进行秒级热替换
 @app.post("/update_cookies")
 def update_cookies(payload: CookiePayload):
     global COOKIE_FILE_PATH, _MEMORY_CACHE
@@ -301,11 +306,10 @@ def update_cookies(payload: CookiePayload):
         target_path = "/tmp/yt_cookies.txt"
         with open(target_path, "wb") as f:
             f.write(raw_bytes)
-        
+
         COOKIE_FILE_PATH = target_path
-        # 清除旧的内存缓存，让下一次提取立刻使用全新的登录态
         _MEMORY_CACHE.clear()
-        print("🎉 [Hot Reload] 成功接收到来自浏览器容器的最新 Cookie！")
+        print("🎉 [Hot Reload] 成功接收并热更新 YouTube Cookie！")
         return {"status": "success", "message": "Cookies updated successfully"}
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Failed to update cookies: {e}")
@@ -321,7 +325,4 @@ async def trending():
         raise HTTPException(status_code=500, detail=str(e))
 
 
-if __name__ == "__main__":
-    import uvicorn
-    port = int(os.environ.get("PORT", 8080))
-    uvicorn.run("main:app", host="0.0.0.0", port=port)
+if __name_
