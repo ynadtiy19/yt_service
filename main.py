@@ -93,7 +93,7 @@ def extract_channel_avatar(info: dict) -> str:
     return ""
 
 
-# 🌟 核心破局配置：使用移动端客户端，不触发 Web 端 Botguard
+# 🌟 完美修复：解除网页配置封锁，允许 Deno 正常解密 1080p、720p 与音频流
 def get_ydl_opts():
     opts = {
         'skip_download': True,
@@ -102,10 +102,13 @@ def get_ydl_opts():
         'no_warnings': True,
         'socket_timeout': 15,
         'no_color': True,
+        # 🌟 允许提取所有可用流，不因为单个特定格式缺失而报错
+        'format': 'bestvideo*+bestaudio/best',
+        'ignore_no_formats_error': True,
         'extractor_args': {
             'youtube': {
-                'player_client': ['ios', 'android', 'mweb'],
-                'player_skip': ['webpage', 'configs'],
+                # 保持移动端客户端优先，抗封且速度最快
+                'player_client': ['android', 'ios', 'mweb'],
             }
         }
     }
