@@ -93,7 +93,7 @@ def extract_channel_avatar(info: dict) -> str:
     return ""
 
 
-# 🌟 完美修复：解除网页配置封锁，允许 Deno 正常解密 1080p、720p 与音频流
+# 🌟 核心修复：加入 tv 与 web 客户端，支持全部画质与独立音轨，排除 pure-storyboard
 def get_ydl_opts():
     opts = {
         'skip_download': True,
@@ -102,13 +102,10 @@ def get_ydl_opts():
         'no_warnings': True,
         'socket_timeout': 15,
         'no_color': True,
-        # 🌟 允许提取所有可用流，不因为单个特定格式缺失而报错
-        'format': 'bestvideo*+bestaudio/best',
-        'ignore_no_formats_error': True,
+        'format': 'all',
         'extractor_args': {
             'youtube': {
-                # 保持移动端客户端优先，抗封且速度最快
-                'player_client': ['android', 'ios', 'mweb'],
+                'player_client': ['tv', 'web', 'ios', 'android'],
             }
         }
     }
@@ -134,6 +131,16 @@ def _extract_worker(url: str):
 
     if not info:
         return None
+
+    # 🌟 过滤掉 storyboard 等纯图片流，只保留真正能播放的视频和音频
+    raw_formats = info.get('formats', [])
+    valid_formats = [
+        f for f in raw_formats 
+        if (f.get('vcodec') != 'none' or f.get('acodec') != 'none')
+        and not f.get('format_note', '').lower().startswith('storyboard')
+        and f.get('ext') != 'mhtml'
+    ]
+    info['formats'] = valid_formats
 
     avatar_url = extract_channel_avatar(info)
     info['author_avatar'] = avatar_url
@@ -252,6 +259,7 @@ def health():
     }
 
 
+# 🌟 修复：修复截断问题，确保正确解析
 @app.get("/extract")
 async def extract(url: str = Query(..., description="YouTube Video ID or Full URL")):
     clean_url = url.strip()
