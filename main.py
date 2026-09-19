@@ -93,7 +93,7 @@ def extract_channel_avatar(info: dict) -> str:
     return ""
 
 
-# 🌟 修复：选用不需要网页重载的客户端组合 (tv_embedded, ios, mweb)
+# 🌟 修复：选用支持输出视频全画质与独立音轨的客户端组合，去掉 format: all 避免抑制媒体流解析
 def get_ydl_opts():
     opts = {
         'skip_download': True,
@@ -102,20 +102,15 @@ def get_ydl_opts():
         'no_warnings': True,
         'socket_timeout': 15,
         'no_color': True,
-        'format': 'all',
         'extractor_args': {
             'youtube': {
-                # 🌟 去掉 'web'，使用 tv_embedded, ios, mweb 彻底避开 "The page needs to be reloaded"
-                'player_client': ['tv_embedded', 'ios', 'mweb'],
+                'player_client': ['android', 'tv'],
             }
         }
     }
     if COOKIE_FILE_PATH:
         opts['cookiefile'] = COOKIE_FILE_PATH
     return opts
-
-
-
 
 
 def _extract_worker(url: str):
@@ -136,15 +131,26 @@ def _extract_worker(url: str):
     if not info:
         return None
 
-    # 🌟 过滤掉 storyboard 等纯图片流，只保留真正能播放的视频和音频
-    raw_formats = info.get('formats', [])
-    valid_formats = [
-        f for f in raw_formats 
-        if (f.get('vcodec') != 'none' or f.get('acodec') != 'none')
-        and not f.get('format_note', '').lower().startswith('storyboard')
-        and f.get('ext') != 'mhtml'
-    ]
-    info['formats'] = valid_formats
+    # 🌟 智能保留：优先提取真实的音视频流（有可播 url 且排除纯图片 storyboard）
+    raw_formats = info.get('formats') or []
+    valid_formats = []
+    for f in raw_formats:
+        if not isinstance(f, dict):
+            continue
+        play_url = f.get('url', '')
+        if not play_url:
+            continue
+        ext = str(f.get('ext', '')).lower()
+        note = str(f.get('format_note', '')).lower()
+
+        # 排除预览缩略图
+        if 'storyboard' in note or ext == 'mhtml':
+            continue
+
+        valid_formats.append(f)
+
+    # 优先使用真实音视频流，避免将格式列表置空
+    info['formats'] = valid_formats if valid_formats else raw_formats
 
     avatar_url = extract_channel_avatar(info)
     info['author_avatar'] = avatar_url
@@ -263,7 +269,7 @@ def health():
     }
 
 
-# 🌟 修复：修复截断问题，确保正确解析
+# 🌟 修复：补全完整的目标 URL，解决代码截断导致的异常
 @app.get("/extract")
 async def extract(url: str = Query(..., description="YouTube Video ID or Full URL")):
     clean_url = url.strip()
