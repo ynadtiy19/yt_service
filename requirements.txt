@@ -1,5 +1,4 @@
 fastapi
-uvicorn[standard]
-playwright
-yt-dlp
-yt-dlp-ejs
+uvicorn
+pydantic
+yt-dlp>=2025.01.01
