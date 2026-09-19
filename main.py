@@ -93,7 +93,7 @@ def extract_channel_avatar(info: dict) -> str:
     return ""
 
 
-# 🌟 修复：选用支持输出视频全画质与独立音轨的客户端组合，去掉 format: all 避免抑制媒体流解析
+# 🌟 核心破局配置：锁定唯一免风控主力 android 客户端，杜绝 The page needs to be reloaded
 def get_ydl_opts():
     opts = {
         'skip_download': True,
@@ -104,7 +104,7 @@ def get_ydl_opts():
         'no_color': True,
         'extractor_args': {
             'youtube': {
-                'player_client': ['android', 'tv'],
+                'player_client': ['android'],
             }
         }
     }
@@ -131,25 +131,15 @@ def _extract_worker(url: str):
     if not info:
         return None
 
-    # 🌟 智能保留：优先提取真实的音视频流（有可播 url 且排除纯图片 storyboard）
+    # 🌟 智能保留：保留所有真实音视频流，过滤纯图片缩略图
     raw_formats = info.get('formats') or []
-    valid_formats = []
-    for f in raw_formats:
-        if not isinstance(f, dict):
-            continue
-        play_url = f.get('url', '')
-        if not play_url:
-            continue
-        ext = str(f.get('ext', '')).lower()
-        note = str(f.get('format_note', '')).lower()
-
-        # 排除预览缩略图
-        if 'storyboard' in note or ext == 'mhtml':
-            continue
-
-        valid_formats.append(f)
-
-    # 优先使用真实音视频流，避免将格式列表置空
+    valid_formats = [
+        f for f in raw_formats 
+        if isinstance(f, dict) 
+        and f.get('url') 
+        and not str(f.get('format_note', '')).lower().startswith('storyboard')
+        and f.get('ext') != 'mhtml'
+    ]
     info['formats'] = valid_formats if valid_formats else raw_formats
 
     avatar_url = extract_channel_avatar(info)
@@ -269,7 +259,7 @@ def health():
     }
 
 
-# 🌟 修复：补全完整的目标 URL，解决代码截断导致的异常
+# 🌟 修复：完整闭合字符串，确保纯 ID 和完整链接都能正常接收
 @app.get("/extract")
 async def extract(url: str = Query(..., description="YouTube Video ID or Full URL")):
     clean_url = url.strip()
