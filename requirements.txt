@@ -1,4 +1,5 @@
 fastapi
 uvicorn[standard]
+playwright
 yt-dlp
 yt-dlp-ejs
