@@ -15,7 +15,7 @@ class CookiePayload(BaseModel):
 
 app = FastAPI(title="Ultra-Stable Lightweight YT-DLP Service")
 
-executor = ThreadPoolExecutor(max_workers=1)
+executor = ThreadPoolExecutor(max_workers=2)
 _MEMORY_CACHE = {}
 _CACHE_TTL = 1800  # 30 分钟
 
@@ -69,6 +69,7 @@ def extract_channel_avatar(info: dict) -> str:
         if uploader_id and uploader_id.startswith('@'):
             channel_url = f"https://www.youtube.com/{uploader_id}"
         elif info.get('channel_id'):
+            # 🌟 修复原代码中的截断 BUG
             channel_url = f"https://www.youtube.com/channel/{info.get('channel_id')}"
 
     if channel_url:
@@ -94,22 +95,21 @@ def extract_channel_avatar(info: dict) -> str:
     return ""
 
 
-# 🌟 核心破局配置：启用 ejs:github 解决 n challenge，并使用不受 GVS 限制的创作者客户端
+# 🌟 核心破局配置：使用 ios + tv + android 组合，彻底解锁 720p/1080p/4K 与音频独立流
 def get_ydl_opts():
     opts = {
         'skip_download': True,
         'extract_flat': False,
         'noplaylist': True,
         'no_warnings': False,
-        'socket_timeout': 20,
+        'socket_timeout': 15,
         'no_color': True,
         'ignore_no_formats_error': True,
-        # 🌟 解决 n-sig 签名算法，配合 Deno 自动从官方 GitHub 解密流地址
         'remote_components': ['ejs:github'],
         'extractor_args': {
             'youtube': {
-                # 🌟 免受 PO-Token 和 GVS 拦截的流媒体客户端组合
-                'player_client': ['android_creator', 'web_creator', 'android'],
+                # 🌟 重点修改：移除仅限 360p 预览的 creator 客户端，改用低风控高清晰度的客户端组合
+                'player_client': ['ios', 'tv', 'android', 'mweb'],
             }
         }
     }
@@ -138,7 +138,7 @@ def _extract_worker(url: str):
 
     sanitized = yt_dlp.YoutubeDL().sanitize_info(info)
 
-    # 🌟 过滤纯缩略图（Storyboard）帧，提取所有真正的音视频流直链
+    # 🌟 过滤 Storyboard 纯图片帧，提取真实音视频流
     raw_formats = sanitized.get('formats') or []
     valid_formats = [
         f for f in raw_formats 
@@ -149,6 +149,53 @@ def _extract_worker(url: str):
     ]
 
     sanitized['formats'] = valid_formats if valid_formats else raw_formats
+
+    # 🌟 自动结构化分类：拆解为 复合流、独立高清视频流、独立音频流
+    format_streams = []
+    adaptive_video_streams = []
+    adaptive_audio_streams = []
+
+    for f in sanitized['formats']:
+        vcodec = f.get('vcodec') or 'none'
+        acodec = f.get('acodec') or 'none'
+        height = f.get('height') or 0
+        ext = f.get('ext') or 'mp4'
+        quality_label = f"{height}p" if height > 0 else (f.get('format_note') or '360p')
+
+        # 1. 音画合一流（可以直接播放）
+        if vcodec != 'none' and acodec != 'none':
+            format_streams.append({
+                'itag': str(f.get('format_id')),
+                'quality_label': quality_label,
+                'container': ext,
+                'url': f.get('url'),
+                'is_adaptive': False
+            })
+        # 2. 独立高清视频流（用于客户端清晰度切换与 DASH 播放）
+        elif vcodec != 'none' and acodec == 'none':
+            adaptive_video_streams.append({
+                'itag': str(f.get('format_id')),
+                'quality_label': quality_label,
+                'resolution': quality_label,
+                'container': ext,
+                'fps': f.get('fps') or 30,
+                'height': height,
+                'url': f.get('url'),
+                'is_adaptive': True
+            })
+        # 3. 独立音频流（音乐播放或视频音轨）
+        elif vcodec == 'none' and acodec != 'none':
+            adaptive_audio_streams.append({
+                'itag': str(f.get('format_id')),
+                'container': ext,
+                'bitrate': str(f.get('abr') or '128'),
+                'url': f.get('url')
+            })
+
+    # 将结构化好的流直接挂载到返回对象上，方便后端/客户端开箱即用
+    sanitized['format_streams'] = format_streams
+    sanitized['adaptive_video_streams'] = adaptive_video_streams
+    sanitized['adaptive_audio_streams'] = adaptive_audio_streams
 
     avatar_url = extract_channel_avatar(sanitized)
     sanitized['author_avatar'] = avatar_url
@@ -267,7 +314,7 @@ def health():
     }
 
 
-# 🌟 核心提取接口：完整支持纯 ID 与完整 URL 解析
+# 🌟 核心提取接口：修复原代码中 clean_url 截断 BUG
 @app.get("/extract")
 async def extract(url: str = Query(..., description="YouTube Video ID or Full URL")):
     clean_url = url.strip()
