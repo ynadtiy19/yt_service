@@ -93,7 +93,7 @@ def extract_channel_avatar(info: dict) -> str:
     return ""
 
 
-# 🌟 核心修复：加入 tv 与 web 客户端，支持全部画质与独立音轨，排除 pure-storyboard
+# 🌟 修复：选用不需要网页重载的客户端组合 (tv_embedded, ios, mweb)
 def get_ydl_opts():
     opts = {
         'skip_download': True,
@@ -105,13 +105,17 @@ def get_ydl_opts():
         'format': 'all',
         'extractor_args': {
             'youtube': {
-                'player_client': ['tv', 'web', 'ios', 'android'],
+                # 🌟 去掉 'web'，使用 tv_embedded, ios, mweb 彻底避开 "The page needs to be reloaded"
+                'player_client': ['tv_embedded', 'ios', 'mweb'],
             }
         }
     }
     if COOKIE_FILE_PATH:
         opts['cookiefile'] = COOKIE_FILE_PATH
     return opts
+
+
+
 
 
 def _extract_worker(url: str):
