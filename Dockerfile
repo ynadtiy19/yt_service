@@ -2,27 +2,23 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
-# 1. 安装基础系统依赖
+# 1. 安装基础工具库与音视频转码工具
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
       curl \
       ca-certificates \
       ffmpeg \
-      fonts-liberation \
-      libnss3 \
-      libatk-bridge2.0-0 \
-      libgtk-3-0 \
-      libasound2 \
-      libdrm2 \
-      libgbm1 && \
+      unzip && \
     rm -rf /var/lib/apt/lists/*
 
-# 2. 安装 Python 依赖
+# 2. 安装 Deno 引擎（专门辅助 yt-dlp 处理 YouTube 最新的 n-sig 签名算法）
+RUN curl -fsSL https://deno.land/install.sh | sh -s -- -y && \
+    cp /root/.deno/bin/deno /usr/local/bin/deno && \
+    rm -rf /root/.deno
+
+# 3. 安装 Python 依赖
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
-
-# 3. 安装 Chromium 内核 (仅内核，不要多余组件)
-RUN playwright install chromium
 
 COPY . .
 
