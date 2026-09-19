@@ -3,6 +3,7 @@ import re
 import time
 import base64
 import asyncio
+import traceback
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from fastapi import FastAPI, HTTPException, Query
@@ -12,11 +13,9 @@ import yt_dlp
 class CookiePayload(BaseModel):
     cookies_base64: str
 
-app = FastAPI(title="Ultra-Stable Lightweight YT-DLP Service")
+app = FastAPI(title="Raw Format Inspector Service")
 
 executor = ThreadPoolExecutor(max_workers=1)
-_MEMORY_CACHE = {}
-_CACHE_TTL = 1800  # 30 分钟
 
 # 载入环境变量 Cookie
 COOKIE_FILE_PATH = None
@@ -35,76 +34,21 @@ if cookie_b64 and cookie_b64.strip():
         COOKIE_FILE_PATH = None
 
 
-def _format_duration(seconds: int) -> str:
-    if not seconds or seconds <= 0:
-        return "00:00"
-    h = seconds // 3600
-    m = (seconds % 3600) // 60
-    s = seconds % 60
-    if h > 0:
-        return f"{h:02d}:{m:02d}:{s:02d}"
-    return f"{m:02d}:{s:02d}"
-
-
-def extract_channel_avatar(info: dict) -> str:
-    for key in ['uploader_avatar', 'channel_avatar', 'avatar']:
-        val = info.get(key)
-        if val and isinstance(val, str) and ('ggpht.com' in val or 'googleusercontent.com' in val):
-            return val
-
-    for t in info.get('channel_thumbnails') or []:
-        if isinstance(t, dict) and t.get('url'):
-            return t['url']
-
-    for t in info.get('thumbnails') or []:
-        if isinstance(t, dict):
-            url = t.get('url', '')
-            if 'yt3.ggpht.com' in url or 'yt3.googleusercontent.com' in url:
-                return url
-
-    channel_url = info.get('channel_url') or info.get('uploader_url')
-    if not channel_url:
-        uploader_id = info.get('uploader_id')
-        if uploader_id and uploader_id.startswith('@'):
-            channel_url = f"https://www.youtube.com/{uploader_id}"
-        elif info.get('channel_id'):
-            channel_url = f"https://www.youtube.com/channel/{info.get('channel_id')}"
-
-    if channel_url:
-        try:
-            req = urllib.request.Request(
-                channel_url,
-                headers={
-                    'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15',
-                    'Accept-Language': 'en-US,en;q=0.9',
-                }
-            )
-            with urllib.request.urlopen(req, timeout=3) as resp:
-                head_chunk = resp.read(65536).decode('utf-8', errors='ignore')
-                og_match = re.search(r'<meta\s+(?:property|name)=["\']og:image["\']\s+content=["\']([^"\']+)["\']', head_chunk, re.IGNORECASE)
-                if og_match:
-                    return og_match.group(1)
-                yt3_match = re.search(r'(https://yt3\.(?:ggpht|googleusercontent)\.com/[^\s"\'<]+)', head_chunk)
-                if yt3_match:
-                    return yt3_match.group(1)
-        except Exception:
-            pass
-
-    return ""
-
-
-# 🌟 核心破局配置：锁定唯一免风控主力 android 客户端，杜绝 The page needs to be reloaded
-def get_ydl_opts():
+# 🌟 全量探针配置：不做任何格式筛选，不丢弃任何流，原生抓取
+def get_raw_inspector_opts():
     opts = {
         'skip_download': True,
         'extract_flat': False,
         'noplaylist': True,
-        'no_warnings': True,
-        'socket_timeout': 15,
+        'no_warnings': False,
+        'socket_timeout': 20,
         'no_color': True,
+        # 允许所有可用格式并忽略格式选择错误，确保全部流进入 formats
+        'ignore_no_formats_error': True,
         'extractor_args': {
             'youtube': {
-                'player_client': ['android'],
+                # 允许多客户端回退，以获取最大范围的音视频流
+                'player_client': ['android', 'web', 'mweb', 'ios'],
             }
         }
     }
@@ -113,141 +57,39 @@ def get_ydl_opts():
     return opts
 
 
-def _extract_worker(url: str):
-    now = time.time()
-    if url in _MEMORY_CACHE:
-        cached_time, cached_data = _MEMORY_CACHE[url]
-        if now - cached_time < _CACHE_TTL:
-            return cached_data
-
-    info = None
+def _raw_extract_worker(target_url: str):
     try:
-        with yt_dlp.YoutubeDL(get_ydl_opts()) as ydl:
-            info = ydl.extract_info(url, download=False)
+        with yt_dlp.YoutubeDL(get_raw_inspector_opts()) as ydl:
+            # 抓取未做任何删减的全部原始信息
+            info = ydl.extract_info(target_url, download=False)
+            if not info:
+                return {"error": "yt-dlp returned empty info", "raw_formats": []}
+            
+            # 使用 yt-dlp 自带的安全序列化工具，保证全部字典可被 JSON 输出
+            sanitized = ydl.sanitize_info(info)
+            
+            # 把全部原始 formats 提取出来
+            raw_formats = sanitized.get("formats") or []
+            
+            return {
+                "id": sanitized.get("id"),
+                "title": sanitized.get("title"),
+                "duration": sanitized.get("duration"),
+                "channel": sanitized.get("channel"),
+                "total_formats_found": len(raw_formats),
+                "has_cookies": COOKIE_FILE_PATH is not None,
+                # 🌟 包含全部原生流信息（包括所有的 format_id, itag, ext, vcodec, acodec, url）
+                "all_formats_list": raw_formats,
+                "thumbnails": sanitized.get("thumbnails"),
+                "full_sanitized_info": sanitized
+            }
     except Exception as e:
-        print(f"⚠️ [提取异常]: {e}")
-        return None
-
-    if not info:
-        return None
-
-    # 🌟 智能保留：保留所有真实音视频流，过滤纯图片缩略图
-    raw_formats = info.get('formats') or []
-    valid_formats = [
-        f for f in raw_formats 
-        if isinstance(f, dict) 
-        and f.get('url') 
-        and not str(f.get('format_note', '')).lower().startswith('storyboard')
-        and f.get('ext') != 'mhtml'
-    ]
-    info['formats'] = valid_formats if valid_formats else raw_formats
-
-    avatar_url = extract_channel_avatar(info)
-    info['author_avatar'] = avatar_url
-    info['uploader_avatar'] = avatar_url
-
-    _MEMORY_CACHE[url] = (now, info)
-    if len(_MEMORY_CACHE) > 100:
-        oldest_key = min(_MEMORY_CACHE.keys(), key=lambda k: _MEMORY_CACHE[k][0])
-        _MEMORY_CACHE.pop(oldest_key, None)
-
-    return info
-
-
-def _flat_search_worker(query: str, limit: int = 20):
-    cache_key = f"search_{query}_{limit}"
-    now = time.time()
-    if cache_key in _MEMORY_CACHE:
-        cached_time, cached_data = _MEMORY_CACHE[cache_key]
-        if now - cached_time < 600:
-            return cached_data
-
-    ydl_opts = {
-        'quiet': True,
-        'no_warnings': True,
-        'skip_download': True,
-        'extract_flat': 'in_playlist',
-        'noplaylist': False,
-        'socket_timeout': 8,
-    }
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        res = ydl.extract_info(f"ytsearch{limit}:{query}", download=False)
-        entries = res.get('entries') or []
-        results = []
-        for item in entries:
-            if not item:
-                continue
-            video_id = item.get('id') or item.get('url')
-            if not video_id:
-                continue
-            duration = int(item.get('duration') or 0)
-            view_count = item.get('view_count') or 0
-            results.append({
-                'video_id': video_id,
-                'title': item.get('title') or '',
-                'author': item.get('uploader') or item.get('channel') or '',
-                'author_id': item.get('uploader_id') or item.get('channel_id') or '',
-                'author_verified': True,
-                'author_avatar': '',
-                'duration': _format_duration(duration),
-                'length_seconds': duration,
-                'is_live': item.get('is_live') or False,
-                'views': f"{view_count} views",
-                'thumbnail': f"https://i.ytimg.com/vi/{video_id}/hqdefault.jpg",
-                'published_text': str(item.get('upload_date') or ''),
-                'description': item.get('description') or '',
-            })
-
-        _MEMORY_CACHE[cache_key] = (now, results)
-        return results
-
-
-def _flat_trending_worker():
-    cache_key = "trending_global"
-    now = time.time()
-    if cache_key in _MEMORY_CACHE:
-        cached_time, cached_data = _MEMORY_CACHE[cache_key]
-        if now - cached_time < 1800:
-            return cached_data
-
-    ydl_opts = {
-        'quiet': True,
-        'no_warnings': True,
-        'skip_download': True,
-        'extract_flat': 'in_playlist',
-        'noplaylist': False,
-        'socket_timeout': 8,
-    }
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        res = ydl.extract_info("ytsearch25:trending", download=False)
-        entries = res.get('entries') or []
-        results = []
-        for item in entries:
-            if not item:
-                continue
-            video_id = item.get('id') or item.get('url')
-            if not video_id:
-                continue
-            duration = int(item.get('duration') or 0)
-            view_count = item.get('view_count') or 0
-            results.append({
-                'video_id': video_id,
-                'title': item.get('title') or '',
-                'author': item.get('uploader') or item.get('channel') or '',
-                'author_id': item.get('uploader_id') or item.get('channel_id') or '',
-                'author_verified': True,
-                'author_avatar': '',
-                'duration': _format_duration(duration),
-                'length_seconds': duration,
-                'is_live': item.get('is_live') or False,
-                'views': f"{view_count} views",
-                'thumbnail': f"https://i.ytimg.com/vi/{video_id}/hqdefault.jpg",
-                'published_text': str(item.get('upload_date') or ''),
-                'description': item.get('description') or '',
-            })
-
-        _MEMORY_CACHE[cache_key] = (now, results)
-        return results
+        return {
+            "error_type": type(e).__name__,
+            "error_message": str(e),
+            "traceback": traceback.format_exc(),
+            "has_cookies": COOKIE_FILE_PATH is not None
+        }
 
 
 @app.get("/health")
@@ -255,11 +97,11 @@ def health():
     return {
         "status": "ok",
         "has_cookies": COOKIE_FILE_PATH is not None,
-        "cached_entries": len(_MEMORY_CACHE)
+        "cookie_path": COOKIE_FILE_PATH
     }
 
 
-# 🌟 修复：完整闭合字符串，确保纯 ID 和完整链接都能正常接收
+# 🌟 核心探针接口：永远返回 200，并吐出全部格式数据
 @app.get("/extract")
 async def extract(url: str = Query(..., description="YouTube Video ID or Full URL")):
     clean_url = url.strip()
@@ -268,31 +110,14 @@ async def extract(url: str = Query(..., description="YouTube Video ID or Full UR
     else:
         target_url = clean_url
 
-    try:
-        loop = asyncio.get_event_loop()
-        info = await loop.run_in_executor(executor, _extract_worker, target_url)
-        if not info:
-            raise HTTPException(status_code=404, detail="Could not extract video info")
-        return info
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.get("/search")
-async def search(q: str = Query(..., description="Search keyword"), limit: int = 20):
-    try:
-        loop = asyncio.get_event_loop()
-        results = await loop.run_in_executor(executor, _flat_search_worker, q, limit)
-        return results
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    loop = asyncio.get_event_loop()
+    result = await loop.run_in_executor(executor, _raw_extract_worker, target_url)
+    return result
 
 
 @app.post("/update_cookies")
 def update_cookies(payload: CookiePayload):
-    global COOKIE_FILE_PATH, _MEMORY_CACHE
+    global COOKIE_FILE_PATH
     try:
         raw_bytes = base64.b64decode(payload.cookies_base64.strip())
         target_path = "/tmp/yt_cookies.txt"
@@ -300,21 +125,10 @@ def update_cookies(payload: CookiePayload):
             f.write(raw_bytes)
 
         COOKIE_FILE_PATH = target_path
-        _MEMORY_CACHE.clear()
         print("🎉 [Hot Reload] 成功更新 YouTube Cookie！")
         return {"status": "success", "message": "Cookies updated successfully"}
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Failed to update cookies: {e}")
-
-
-@app.get("/trending")
-async def trending():
-    try:
-        loop = asyncio.get_event_loop()
-        results = await loop.run_in_executor(executor, _flat_trending_worker)
-        return results
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
 
 
 if __name__ == "__main__":
