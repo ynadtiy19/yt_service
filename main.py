@@ -13,7 +13,6 @@ from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel
 import yt_dlp
 
-# 🌟 核心修复：定义 Cookie 载荷数据结构（解决 NameError）
 class CookiePayload(BaseModel):
     cookies_base64: str
 
@@ -24,17 +23,58 @@ _tunnel_started = False
 
 
 def _init_ssh_and_keys():
-    """从环境变量动态读取并初始化 SSH 密码与 AtKeys 文件"""
+    """从环境变量动态读取并初始化 SSH 密码与 AtKeys 文件，并强制开启 root 密码登录"""
     ssh_password = os.environ.get("PASSWORD", "noports123")
+    
+    # 1. 强制修改 root 密码
     subprocess.run(
         f'echo "root:{ssh_password}" | chpasswd',
         shell=True,
         check=True
     )
 
+    # 🌟🌟 核心修复：强制开启 SSH 服务端的 root 密码与交互式认证 🌟🌟
+    sshd_config_dir = "/etc/ssh/sshd_config.d"
+    custom_conf = (
+        "\n# === 由 Python 自动注入，允许手机端通过 root 密码建立 SOCKS5 隧道 ===\n"
+        "PermitRootLogin yes\n"
+        "PasswordAuthentication yes\n"
+        "KbdInteractiveAuthentication yes\n"
+        "ChallengeResponseAuthentication yes\n"
+        "UsePAM yes\n"
+    )
+
+    try:
+        # 如果系统支持 sshd_config.d 目录，优先写入独立文件，防止被系统覆盖
+        if os.path.exists(sshd_config_dir):
+            with open(f"{sshd_config_dir}/99-allow-root-password.conf", "w") as f:
+                f.write(custom_conf)
+            print("✅ [SSH Config] 已通过 sshd_config.d 成功注入 root 密码登录权限！")
+        
+        # 兼容传统单个配置文件的系统（Debian/Alpine/Ubuntu）
+        if os.path.exists("/etc/ssh/sshd_config"):
+            with open("/etc/ssh/sshd_config", "r") as f:
+                orig_cfg = f.read()
+            
+            # 注释掉默认禁止密码的行
+            orig_cfg = re.sub(r'(?i)^\s*PermitRootLogin\s+.*', '# PermitRootLogin overridden', orig_cfg, flags=re.MULTILINE)
+            orig_cfg = re.sub(r'(?i)^\s*PasswordAuthentication\s+.*', '# PasswordAuthentication overridden', orig_cfg, flags=re.MULTILINE)
+            
+            # 追加放行配置
+            with open("/etc/ssh/sshd_config", "w") as f:
+                f.write(orig_cfg + custom_conf)
+            print("✅ [SSH Config] 已在 /etc/ssh/sshd_config 成功追加 root 密码登录权限！")
+            
+        # 确保运行时目录存在
+        os.makedirs("/run/sshd", exist_ok=True)
+    except Exception as e:
+        print(f"⚠️ [SSH Config] 写入配置时出现警告 (将继续尝试启动): {e}")
+
+    # 2. 注入 AtKeys 文件
     atkeys_content = os.environ.get("ATKEYS_CONTENT", "")
     device_atsign = os.environ.get("DEVICE_ATSIGN", "@absolute3140")
     key_path = f"/root/.atsign/keys/{device_atsign}_key.atKeys"
+    os.makedirs("/root/.atsign/keys", exist_ok=True)
 
     if atkeys_content.strip():
         try:
@@ -78,7 +118,9 @@ def _start_background_tunnel():
 
             key_path = _init_ssh_and_keys()
 
+            # 🌟 启动 SSHD（此时已包含 root 密码登录权限）
             subprocess.run(["/usr/sbin/sshd"], check=True)
+            print("✅ [Zeabur Tunnel] OpenSSH 守护进程已成功启动并开启密码认证！")
 
             device_atsign = os.environ.get("DEVICE_ATSIGN", "@absolute3140")
             manager_atsign = os.environ.get("MANAGER_ATSIGN", "@gemini2banana")
@@ -246,7 +288,6 @@ def _extract_worker(url: str):
         ext = f.get('ext') or 'mp4'
         quality_label = f"{height}p" if height > 0 else (f.get('format_note') or '360p')
 
-        # 1. 复合流 (音画合一)
         if vcodec != 'none' and acodec != 'none':
             format_streams.append({
                 'itag': str(f.get('format_id')),
@@ -255,7 +296,6 @@ def _extract_worker(url: str):
                 'url': f.get('url'),
                 'is_adaptive': False
             })
-        # 2. 独立高清视频流 (720p, 1080p, 1440p, 4K)
         elif vcodec != 'none' and acodec == 'none':
             adaptive_video_streams.append({
                 'itag': str(f.get('format_id')),
@@ -267,7 +307,6 @@ def _extract_worker(url: str):
                 'url': f.get('url'),
                 'is_adaptive': True
             })
-        # 3. 独立音频流 (M4A / Opus)
         elif vcodec == 'none' and acodec != 'none':
             adaptive_audio_streams.append({
                 'itag': str(f.get('format_id')),
@@ -406,10 +445,8 @@ def _flat_trending_worker():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # 服务启动时初始化并启动隧道
     _start_background_tunnel()
     yield
-    # 服务退出清理
     executor.shutdown(wait=False)
 
 web_app = FastAPI(title="Ultra-Stable Lightweight YT-DLP Service", lifespan=lifespan)
