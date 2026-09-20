@@ -1,39 +1,120 @@
 import os
+import gc
 import re
+import json
 import time
 import base64
-import asyncio
-import traceback
+import threading
+import subprocess
 import urllib.request
+from contextlib import asynccontextmanager
 from concurrent.futures import ThreadPoolExecutor
 from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel
 import yt_dlp
 
+# 🌟 核心修复：定义 Cookie 载荷数据结构（解决 NameError）
 class CookiePayload(BaseModel):
     cookies_base64: str
 
-app = FastAPI(title="Ultra-Stable Lightweight YT-DLP Service")
-
 executor = ThreadPoolExecutor(max_workers=2)
 _MEMORY_CACHE = {}
-_CACHE_TTL = 1800  # 30 分钟
+_CACHE_TTL = 1800
+_tunnel_started = False
 
-# 载入环境变量 Cookie
-COOKIE_FILE_PATH = None
-cookie_b64 = os.environ.get("YOUTUBE_COOKIES_BASE64")
 
-if cookie_b64 and cookie_b64.strip():
+def _init_ssh_and_keys():
+    """从环境变量动态读取并初始化 SSH 密码与 AtKeys 文件"""
+    ssh_password = os.environ.get("PASSWORD", "noports123")
+    subprocess.run(
+        f'echo "root:{ssh_password}" | chpasswd',
+        shell=True,
+        check=True
+    )
+
+    atkeys_content = os.environ.get("ATKEYS_CONTENT", "")
+    device_atsign = os.environ.get("DEVICE_ATSIGN", "@absolute3140")
+    key_path = f"/root/.atsign/keys/{device_atsign}_key.atKeys"
+
+    if atkeys_content.strip():
+        try:
+            data = json.loads(atkeys_content.strip())
+            for k, v in data.items():
+                if isinstance(v, str):
+                    clean_v = v.strip().rstrip("=")
+                    rem = len(clean_v) % 4
+                    if rem == 2:
+                        data[k] = clean_v + "=="
+                    elif rem == 3:
+                        data[k] = clean_v + "="
+                    else:
+                        data[k] = clean_v
+            with open(key_path, "w") as f:
+                f.write(json.dumps(data))
+            os.chmod(key_path, 0o600)
+            print(f"✅ [AtKeys] 成功从环境变量注入并格式化密钥: {key_path}")
+        except Exception as e:
+            print(f"⚠️ [AtKeys] 写入异常: {e}")
+            with open(key_path, "w") as f:
+                f.write(atkeys_content.strip())
+            os.chmod(key_path, 0o600)
+    
+    return key_path
+
+
+def _start_background_tunnel():
+    """在后台常驻启动 sshd 与 sshnpd 守护进程"""
+    global _tunnel_started
+    if _tunnel_started:
+        return
+    _tunnel_started = True
+
+    def _worker():
+        try:
+            print("🚀 [Zeabur Tunnel] 正在初始化后台 SSH 与 NoPorts 守护进程...")
+            env = os.environ.copy()
+            env["HOME"] = "/root"
+            env["USER"] = "/root"
+
+            key_path = _init_ssh_and_keys()
+
+            subprocess.run(["/usr/sbin/sshd"], check=True)
+
+            device_atsign = os.environ.get("DEVICE_ATSIGN", "@absolute3140")
+            manager_atsign = os.environ.get("MANAGER_ATSIGN", "@gemini2banana")
+            device_name = os.environ.get("DEVICE_NAME", "zeabur")
+
+            cmd = [
+                "/root/.local/bin/sshnpd",
+                "-a", device_atsign,
+                "-m", manager_atsign,
+                "-d", device_name,
+                "-k", key_path,
+                "-s",
+                "--no-hide"
+            ]
+            print(f"📡 [Zeabur Tunnel] sshnpd 已就绪并在后台监听 (设备名: {device_name})...")
+            subprocess.Popen(cmd, env=env)
+        except Exception as e:
+            print(f"🔴 [Zeabur Tunnel] 启动异常: {e}")
+
+    threading.Thread(target=_worker, daemon=True).start()
+
+
+def _get_cookie_file_path() -> str | None:
+    cookie_b64 = os.environ.get("YOUTUBE_COOKIES_BASE64")
+    if not cookie_b64 or not cookie_b64.strip():
+        return None
     try:
         sanitized_b64 = cookie_b64.replace("\r", "").replace("\n", "").strip()
         decoded_bytes = base64.b64decode(sanitized_b64)
-        COOKIE_FILE_PATH = "/tmp/yt_cookies.txt"
-        with open(COOKIE_FILE_PATH, "wb") as f:
+        cookie_path = "/tmp/yt_cookies.txt"
+        with open(cookie_path, "wb") as f:
             f.write(decoded_bytes)
-        print("✅ [Cookie Loader] 成功装载 YouTube Cookie 凭据！")
+        return cookie_path
     except Exception as e:
-        print(f"⚠️ [Cookie Loader] Cookie 解密失败: {e}")
-        COOKIE_FILE_PATH = None
+        print(f"⚠️ [Cookie Loader] 解密失败: {e}")
+        return None
 
 
 def _format_duration(seconds: int) -> str:
@@ -69,7 +150,6 @@ def extract_channel_avatar(info: dict) -> str:
         if uploader_id and uploader_id.startswith('@'):
             channel_url = f"https://www.youtube.com/{uploader_id}"
         elif info.get('channel_id'):
-            # 🌟 修复原代码中的截断 BUG
             channel_url = f"https://www.youtube.com/channel/{info.get('channel_id')}"
 
     if channel_url:
@@ -95,26 +175,27 @@ def extract_channel_avatar(info: dict) -> str:
     return ""
 
 
-# 🌟 核心破局配置：使用 ios + tv + android 组合，彻底解锁 720p/1080p/4K 与音频独立流
 def get_ydl_opts():
+    cookie_file = _get_cookie_file_path()
     opts = {
         'skip_download': True,
         'extract_flat': False,
         'noplaylist': True,
-        'no_warnings': False,
+        'no_warnings': True,
         'socket_timeout': 15,
         'no_color': True,
         'ignore_no_formats_error': True,
+        'writesubtitles': False,
+        'writeautomaticsub': False,
         'remote_components': ['ejs:github'],
         'extractor_args': {
             'youtube': {
-                # 🌟 重点修改：移除仅限 360p 预览的 creator 客户端，改用低风控高清晰度的客户端组合
-                'player_client': ['ios', 'tv', 'android', 'mweb'],
+                'player_client': ['android_vr', 'ios', 'web_safari', 'android'],
             }
         }
     }
-    if COOKIE_FILE_PATH:
-        opts['cookiefile'] = COOKIE_FILE_PATH
+    if cookie_file:
+        opts['cookiefile'] = cookie_file
     return opts
 
 
@@ -138,31 +219,34 @@ def _extract_worker(url: str):
 
     sanitized = yt_dlp.YoutubeDL().sanitize_info(info)
 
-    # 🌟 过滤 Storyboard 纯图片帧，提取真实音视频流
+    for useless_key in ['automatic_captions', 'subtitles', 'heatmap', 'comments']:
+        sanitized.pop(useless_key, None)
+
     raw_formats = sanitized.get('formats') or []
     valid_formats = [
         f for f in raw_formats 
         if isinstance(f, dict) 
         and f.get('url') 
         and not str(f.get('format_note', '')).lower().startswith('storyboard')
+        and not str(f.get('format_id', '')).startswith('sb')
         and f.get('ext') != 'mhtml'
+        and (f.get('vcodec') != 'none' or f.get('acodec') != 'none')
     ]
 
-    sanitized['formats'] = valid_formats if valid_formats else raw_formats
+    sanitized['formats'] = valid_formats
 
-    # 🌟 自动结构化分类：拆解为 复合流、独立高清视频流、独立音频流
     format_streams = []
     adaptive_video_streams = []
     adaptive_audio_streams = []
 
-    for f in sanitized['formats']:
+    for f in valid_formats:
         vcodec = f.get('vcodec') or 'none'
         acodec = f.get('acodec') or 'none'
         height = f.get('height') or 0
         ext = f.get('ext') or 'mp4'
         quality_label = f"{height}p" if height > 0 else (f.get('format_note') or '360p')
 
-        # 1. 音画合一流（可以直接播放）
+        # 1. 复合流 (音画合一)
         if vcodec != 'none' and acodec != 'none':
             format_streams.append({
                 'itag': str(f.get('format_id')),
@@ -171,7 +255,7 @@ def _extract_worker(url: str):
                 'url': f.get('url'),
                 'is_adaptive': False
             })
-        # 2. 独立高清视频流（用于客户端清晰度切换与 DASH 播放）
+        # 2. 独立高清视频流 (720p, 1080p, 1440p, 4K)
         elif vcodec != 'none' and acodec == 'none':
             adaptive_video_streams.append({
                 'itag': str(f.get('format_id')),
@@ -183,7 +267,7 @@ def _extract_worker(url: str):
                 'url': f.get('url'),
                 'is_adaptive': True
             })
-        # 3. 独立音频流（音乐播放或视频音轨）
+        # 3. 独立音频流 (M4A / Opus)
         elif vcodec == 'none' and acodec != 'none':
             adaptive_audio_streams.append({
                 'itag': str(f.get('format_id')),
@@ -192,7 +276,9 @@ def _extract_worker(url: str):
                 'url': f.get('url')
             })
 
-    # 将结构化好的流直接挂载到返回对象上，方便后端/客户端开箱即用
+    adaptive_video_streams.sort(key=lambda x: x.get('height') or 0, reverse=True)
+    adaptive_audio_streams.sort(key=lambda x: float(x.get('bitrate') or 0), reverse=True)
+
     sanitized['format_streams'] = format_streams
     sanitized['adaptive_video_streams'] = adaptive_video_streams
     sanitized['adaptive_audio_streams'] = adaptive_audio_streams
@@ -202,10 +288,11 @@ def _extract_worker(url: str):
     sanitized['uploader_avatar'] = avatar_url
 
     _MEMORY_CACHE[url] = (now, sanitized)
-    if len(_MEMORY_CACHE) > 100:
+    if len(_MEMORY_CACHE) > 30:
         oldest_key = min(_MEMORY_CACHE.keys(), key=lambda k: _MEMORY_CACHE[k][0])
         _MEMORY_CACHE.pop(oldest_key, None)
 
+    gc.collect()
     return sanitized
 
 
@@ -254,6 +341,11 @@ def _flat_search_worker(query: str, limit: int = 20):
             })
 
         _MEMORY_CACHE[cache_key] = (now, results)
+        if len(_MEMORY_CACHE) > 30:
+            oldest_key = min(_MEMORY_CACHE.keys(), key=lambda k: _MEMORY_CACHE[k][0])
+            _MEMORY_CACHE.pop(oldest_key, None)
+
+        gc.collect()
         return results
 
 
@@ -302,20 +394,38 @@ def _flat_trending_worker():
             })
 
         _MEMORY_CACHE[cache_key] = (now, results)
+        if len(_MEMORY_CACHE) > 30:
+            oldest_key = min(_MEMORY_CACHE.keys(), key=lambda k: _MEMORY_CACHE[k][0])
+            _MEMORY_CACHE.pop(oldest_key, None)
+
+        gc.collect()
         return results
 
 
-@app.get("/health")
+# ==================== FastAPI 生命周期与端点 ====================
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # 服务启动时初始化并启动隧道
+    _start_background_tunnel()
+    yield
+    # 服务退出清理
+    executor.shutdown(wait=False)
+
+web_app = FastAPI(title="Ultra-Stable Lightweight YT-DLP Service", lifespan=lifespan)
+
+@web_app.get("/health")
 def health():
+    has_cookies = _get_cookie_file_path() is not None
     return {
         "status": "ok",
-        "has_cookies": COOKIE_FILE_PATH is not None,
+        "has_cookies": has_cookies,
+        "tunnel_active": _tunnel_started,
+        "device_name": os.environ.get("DEVICE_NAME", "zeabur"),
         "cached_entries": len(_MEMORY_CACHE)
     }
 
-
-# 🌟 核心提取接口：修复原代码中 clean_url 截断 BUG
-@app.get("/extract")
+@web_app.get("/extract")
 async def extract(url: str = Query(..., description="YouTube Video ID or Full URL")):
     clean_url = url.strip()
     if not clean_url.startswith("http"):
@@ -324,7 +434,8 @@ async def extract(url: str = Query(..., description="YouTube Video ID or Full UR
         target_url = clean_url
 
     try:
-        loop = asyncio.get_event_loop()
+        import asyncio
+        loop = asyncio.get_running_loop()
         info = await loop.run_in_executor(executor, _extract_worker, target_url)
         if not info:
             raise HTTPException(status_code=404, detail="Could not extract video info")
@@ -334,45 +445,37 @@ async def extract(url: str = Query(..., description="YouTube Video ID or Full UR
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-
-@app.get("/search")
+@web_app.get("/search")
 async def search(q: str = Query(..., description="Search keyword"), limit: int = 20):
     try:
-        loop = asyncio.get_event_loop()
+        import asyncio
+        loop = asyncio.get_running_loop()
         results = await loop.run_in_executor(executor, _flat_search_worker, q, limit)
         return results
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-
-@app.post("/update_cookies")
+@web_app.post("/update_cookies")
 def update_cookies(payload: CookiePayload):
-    global COOKIE_FILE_PATH, _MEMORY_CACHE
+    global _MEMORY_CACHE
     try:
         raw_bytes = base64.b64decode(payload.cookies_base64.strip())
         target_path = "/tmp/yt_cookies.txt"
         with open(target_path, "wb") as f:
             f.write(raw_bytes)
 
-        COOKIE_FILE_PATH = target_path
         _MEMORY_CACHE.clear()
-        print("🎉 [Hot Reload] 成功更新 YouTube Cookie！")
+        gc.collect()
         return {"status": "success", "message": "Cookies updated successfully"}
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Failed to update cookies: {e}")
 
-
-@app.get("/trending")
+@web_app.get("/trending")
 async def trending():
     try:
-        loop = asyncio.get_event_loop()
+        import asyncio
+        loop = asyncio.get_running_loop()
         results = await loop.run_in_executor(executor, _flat_trending_worker)
         return results
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
-
-
-if __name__ == "__main__":
-    import uvicorn
-    port = int(os.environ.get("PORT", 8080))
-    uvicorn.run("main:app", host="0.0.0.0", port=port)
